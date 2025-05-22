@@ -12,7 +12,11 @@ char serverAddress[] = "192.168.194.55";  // Flask server IP
 int port = 5000;
 
 bool manualOverride = false;
-bool manualPumpState = false;  // true = ON, false = OFF
+bool manualPumpState = false;
+bool wasConnected = false;
+
+unsigned long lastReconnectAttempt = 0;
+const unsigned long reconnectInterval = 300000; // 5 minutes
 
 void setup() {
   Serial.begin(9600);
@@ -20,62 +24,97 @@ void setup() {
   pinMode(relayPin, OUTPUT);
   digitalWrite(relayPin, LOW);
 
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    Serial.println("Connecting to WiFi...");
-  }
-  Serial.println("Connected to WiFi");
+  connectToWiFi(); // Initial connection
 }
 
 void loop() {
-  // 1. Read soil moisture
   int moisture = analogRead(soilPin);
   Serial.print("Soil Moisture: ");
   Serial.println(moisture);
 
-  // 2. Send moisture to Flask server
-  if (client.connect(serverAddress, port)) {
-    client.print("GET /update?moisture=");
-    client.print(moisture);
-    client.println(" HTTP/1.1");
-    client.print("Host: ");
-    client.println(serverAddress);
-    client.println("Connection: close");
-    client.println();
-    client.stop();
+  // Check if WiFi is connected
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wasConnected) {
+      Serial.println("WiFi Reconnected");
+      wasConnected = true;
+    }
+
+    // Send moisture data
+    if (client.connect(serverAddress, port)) {
+      client.print("GET /update?moisture=");
+      client.print(moisture);
+      client.println(" HTTP/1.1");
+      client.print("Host: ");
+      client.println(serverAddress);
+      client.println("Connection: close");
+      client.println();
+      client.stop();
+    }
+
+    // Get command from GUI
+    delay(200); // Brief wait before reading command
+    String command = getPumpCommand();
+
+    if (command == "manual_on") {
+      manualOverride = true;
+      manualPumpState = true;
+      Serial.println("Manual command: ON");
+    } else if (command == "manual_off") {
+      manualOverride = true;
+      manualPumpState = false;
+      Serial.println("Manual command: OFF");
+    } else if (command == "auto") {
+      manualOverride = false;
+      Serial.println("Command: AUTO mode");
+    }
+
+  } else {
+    // Not connected: run in auto mode only
+    if (wasConnected) {
+      Serial.println("WiFi lost. Reverting to AUTO mode.");
+      wasConnected = false;
+      manualOverride = false;
+    }
+
+    // Attempt to reconnect every 5 minutes
+    if (millis() - lastReconnectAttempt > reconnectInterval) {
+      lastReconnectAttempt = millis();
+      connectToWiFi();
+    }
   }
 
-  // 3. Get command from Flask server
-  delay(200);  // Short delay between requests
-  String command = getPumpCommand();
-
-  // 4. Handle command
-  if (command == "manual_on") {
-    manualOverride = true;
-    manualPumpState = true;
-    Serial.println("Manual command: ON");
-  } else if (command == "manual_off") {
-    manualOverride = true;
-    manualPumpState = false;
-    Serial.println("Manual command: OFF");
-  } else if (command == "auto") {
-    manualOverride = false;
-    Serial.println("Command: AUTO mode");
-  }
-
-  // 5. Control pump
+  // Handle pump logic
   if (manualOverride) {
     digitalWrite(relayPin, manualPumpState ? HIGH : LOW);
   } else {
     if (moisture < 700) {
-      digitalWrite(relayPin, LOW);
+      digitalWrite(relayPin, LOW); // Pump ON
+      Serial.println("Pump ON (Auto)");
     } else {
-      digitalWrite(relayPin, HIGH);
+      digitalWrite(relayPin, HIGH); // Pump OFF
+      Serial.println("Pump OFF (Auto)");
     }
   }
 
-  delay(5000);  // Wait before next loop
+  delay(5000); // Main loop delay
+}
+
+void connectToWiFi() {
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(ssid, password);
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) {
+    delay(1000);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected to WiFi.");
+    wasConnected = true;
+  } else {
+    Serial.println("\nFailed to connect. Starting in AUTO mode.");
+    wasConnected = false;
+  }
 }
 
 String getPumpCommand() {
@@ -96,13 +135,13 @@ String getPumpCommand() {
       }
     }
 
-    // Skip HTTP headers
+    // Skip headers
     while (client.available()) {
       String line = client.readStringUntil('\n');
-      if (line == "\r") break;  // End of headers
+      if (line == "\r") break;
     }
 
-    // Read response body
+    // Read body
     while (client.available()) {
       char c = client.read();
       response += c;
