@@ -1,0 +1,118 @@
+#include <WiFiNINA.h>
+#include <ArduinoHttpClient.h>
+
+const char* ssid = "POCOF3";
+const char* password = "namme36626";
+
+int soilPin = A0;
+int relayPin = 2;
+
+WiFiClient client;
+char serverAddress[] = "192.168.194.55";  // Flask server IP
+int port = 5000;
+
+bool manualOverride = false;
+bool manualPumpState = false;  // true = ON, false = OFF
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(soilPin, INPUT);
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, LOW);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+  Serial.println("Connected to WiFi");
+}
+
+void loop() {
+  // 1. Read soil moisture
+  int moisture = analogRead(soilPin);
+  Serial.print("Soil Moisture: ");
+  Serial.println(moisture);
+
+  // 2. Send moisture to Flask server
+  if (client.connect(serverAddress, port)) {
+    client.print("GET /update?moisture=");
+    client.print(moisture);
+    client.println(" HTTP/1.1");
+    client.print("Host: ");
+    client.println(serverAddress);
+    client.println("Connection: close");
+    client.println();
+    client.stop();
+  }
+
+  // 3. Get command from Flask server
+  delay(200);  // Short delay between requests
+  String command = getPumpCommand();
+
+  // 4. Handle command
+  if (command == "manual_on") {
+    manualOverride = true;
+    manualPumpState = true;
+    Serial.println("Manual command: ON");
+  } else if (command == "manual_off") {
+    manualOverride = true;
+    manualPumpState = false;
+    Serial.println("Manual command: OFF");
+  } else if (command == "auto") {
+    manualOverride = false;
+    Serial.println("Command: AUTO mode");
+  }
+
+  // 5. Control pump
+  if (manualOverride) {
+    digitalWrite(relayPin, manualPumpState ? HIGH : LOW);
+  } else {
+    if (moisture < 700) {
+      digitalWrite(relayPin, LOW);
+    } else {
+      digitalWrite(relayPin, HIGH);
+    }
+  }
+
+  delay(5000);  // Wait before next loop
+}
+
+String getPumpCommand() {
+  String response = "";
+  if (client.connect(serverAddress, port)) {
+    client.print("GET /command HTTP/1.1\r\n");
+    client.print("Host: ");
+    client.println(serverAddress);
+    client.println("Connection: close");
+    client.println();
+
+    unsigned long timeout = millis();
+    while (client.available() == 0) {
+      if (millis() - timeout > 2000) {
+        Serial.println(">>> Timeout getting command");
+        client.stop();
+        return "";
+      }
+    }
+
+    // Skip HTTP headers
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      if (line == "\r") break;  // End of headers
+    }
+
+    // Read response body
+    while (client.available()) {
+      char c = client.read();
+      response += c;
+    }
+
+    client.stop();
+  }
+
+  response.trim();
+  Serial.print("Command response: ");
+  Serial.println(response);
+  return response;
+}
